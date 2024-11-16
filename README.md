@@ -125,14 +125,20 @@ git clone https://github.com/MVHespanholo/ESP32-Estufa-PI4
 pio lib install
 ```
 
-4. Configure o WiFi
-```cpp
-const char* ssid = "seu-wifi";
-const char* password = "sua-senha";
+4. Copie o arquivo `config.example.h` para `config.h`
+
+5. Edite `config.h` e adicione suas credenciais:
+   - Configurações do WiFi
+   - Credenciais do Adafruit IO
+   - Outros parâmetros necessários
+
+6. Compile e faça upload para seu ESP32
+
+```bash
+# Comandos para configuração inicial
+cp config.example.h config.h
+# Edite config.h com suas credenciais
 ```
-
-5. Compile e faça o upload para o ESP32
-
 ## ⚡ Parâmetros de Configuração
 
 ### Limites de Operação
