@@ -6,8 +6,8 @@
 // Copie este arquivo para config.h e preencha com suas credenciais
 
 // Configurações do WiFi
-const char* ssid = "WIFI_SSID";
-const char* password = "WIFI_PASSWORD";
+const char* ssid = "Wokwi-GUEST";  // WIFI SSID
+const char* password = "";  // WIFI PASSWORD
 
 // Configurações do MQTT
 const char* mqtt_server = "io.adafruit.com";
