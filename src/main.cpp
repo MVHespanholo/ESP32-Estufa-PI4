@@ -6,28 +6,24 @@
 #include <WiFiUdp.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-
-// Incluir arquivo de configuração
 #include "config.h"
-
-// Clientes WiFi e MQTT
-WiFiClient espClient;
-PubSubClient client(espClient);
-
-// Configuração NTP
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", -3 * 3600);
 
 // Definição dos pinos
 #define DHT_INTERNO_PIN 4
 #define DHT_EXTERNO_PIN 32
 #define LDR_PIN 36
-#define LED_STATUS 2
 #define VENT_1_PIN 26
 #define VENT_2_PIN 27
 #define EXAUST_1_PIN 14
 #define EXAUST_2_PIN 12
 #define AQUEC_PIN 13
+#define LED_STATUS      2   // LED de status do sistema
+#define LED_AQUEC       17  // LED indicador do aquecedor
+#define LED_VENT1       18  // LED indicador do ventilador 1
+#define LED_VENT2       5   // LED indicador do ventilador 2
+#define LED_EXAUST1     19  // LED indicador do exaustor 1
+#define LED_EXAUST2     23  // LED indicador do exaustor 2
+#define LED_ALARM       21  // LED indicador de alarme
 
 // Configurações PWM
 const int CANAL_PWM_VENT1 = 0;
@@ -38,18 +34,18 @@ const int FREQ_PWM = 5000;
 const int RESOLUCAO_PWM = 8;
 
 // Limites de operação
-float TEMP_MAX = 70.0;
+float TEMP_MAX = 100.0;
 float TEMP_MIN = 30.0;
 float TEMP_TARGET = 50.0;
-float UMID_MAX = 60.0;
+float UMID_MAX = 90.0;
 float UMID_MIN = 5.0;
 
 // Estrutura para limites de alarme
 struct LimitesAlarme {
-    float tempMax = 90.0;
+    float tempMax = 80.0;
     float tempMin = 40.0;
     float umidMax = 80.0;
-    float umidMin = 15.0;
+    float umidMin = 10.0;
 } limites;
 
 // Variáveis de estado
@@ -57,16 +53,62 @@ bool aquecimentoLigado = false;
 bool ventiladoresLigados = false;
 bool exaustoresLigados = false;
 bool alarmeAtivo = false;
-bool alarmeSoado = false;
 
 // Variáveis de tempo
-unsigned long tempoUltimaAtualizacao = 0;
 unsigned long ultimaLeituraDHT1 = 0;
 unsigned long ultimaLeituraDHT2 = 0;
 const unsigned long INTERVALO_ATUALIZACAO = 3000;  // 5 segundos
 const unsigned long INTERVALO_LEITURA_DHT = 2500;  // 2.5 segundos
 unsigned long lastMsg = 0;
 const long interval = 5000;  // Intervalo de envio de dados (5 segundos)
+
+// Variáveis para controle de velocidade
+int velocidadeVentiladores = 0;  // Velocidade atual dos ventiladores
+int velocidadeExaustores = 0;   // Velocidade atual dos exaustores
+
+// Estrutura para controle de padrões de pisca
+struct BlinkPattern {
+    unsigned long interval;
+    unsigned long lastChange;
+    bool state;
+    bool enabled;
+};
+
+// Padrões de pisca para cada LED
+BlinkPattern ledPatterns[] = {
+    {500, 0, false, true},   // STATUS
+    {250, 0, false, false},  // AQUEC
+    {250, 0, false, false},  // VENT1
+    {250, 0, false, false},  // VENT2
+    {250, 0, false, false},  // EXAUST1
+    {250, 0, false, false},  // EXAUST2
+    {250, 0, false, false}   // ALARM
+};
+
+// Array com os pinos dos LEDs
+const int ledPins[] = {
+    LED_STATUS, LED_AQUEC, LED_VENT1, LED_VENT2, 
+    LED_EXAUST1, LED_EXAUST2, LED_ALARM
+};
+
+// Enumeração para facilitar o acesso aos LEDs
+enum LedIndex {
+    LED_IDX_STATUS = 0,
+    LED_IDX_AQUEC = 1,
+    LED_IDX_VENT1 = 2,
+    LED_IDX_VENT2 = 3,
+    LED_IDX_EXAUST1 = 4,
+    LED_IDX_EXAUST2 = 5,
+    LED_IDX_ALARM = 6
+};
+
+// Clientes WiFi e MQTT
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Configuração NTP
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", -3 * 3600);
 
 // Configuração dos sensores DHT22
 #define DHTTYPE DHT22
@@ -87,16 +129,76 @@ int luminosidade = 0;
 void lerSensores();
 void controlarTemperatura();
 void controlarUmidade();
-void atualizarDisplay();
 void setupWiFi();
 void reconnectMQTT();
 void enviarDadosSerial();
 void callback(char* topic, byte* payload, unsigned int length);
 void enviarDadosMQTT();
 
-/**
- * Realiza a leitura dos sensores com intervalo entre cada sensor
- */
+// Função para inicializar os LEDs
+void setupLEDs() {
+    for (int i = 0; i < sizeof(ledPins)/sizeof(ledPins[0]); i++) {
+        pinMode(ledPins[i], OUTPUT);
+        digitalWrite(ledPins[i], LOW);
+    }
+}
+
+// Função para atualizar o estado de um LED específico
+void updateLED(LedIndex index, bool enabled, unsigned long interval = 0) {
+    ledPatterns[index].enabled = enabled;
+    if (interval > 0) {
+        ledPatterns[index].interval = interval;
+    }
+}
+
+// Função para atualizar todos os LEDs
+void updateLEDs() {
+    unsigned long currentMillis = millis();
+    
+    for (int i = 0; i < sizeof(ledPins)/sizeof(ledPins[0]); i++) {
+        BlinkPattern& pattern = ledPatterns[i];
+        
+        if (!pattern.enabled) {
+            digitalWrite(ledPins[i], LOW);
+            continue;
+        }
+        
+        // Se é um LED que deve ficar fixo (interval = 0)
+        if (pattern.interval == 0) {
+            digitalWrite(ledPins[i], HIGH);
+            continue;
+        }
+        
+        // Atualiza o estado do LED de acordo com o padrão de pisca
+        if (currentMillis - pattern.lastChange >= pattern.interval) {
+            pattern.state = !pattern.state;
+            digitalWrite(ledPins[i], pattern.state);
+            pattern.lastChange = currentMillis;
+        }
+    }
+}
+
+// Função para atualizar estados dos LEDs baseado no estado do sistema
+void updateSystemLEDs() {
+    // Status do sistema sempre piscando
+    updateLED(LED_IDX_STATUS, true, 500);
+    
+    // Aquecimento
+    updateLED(LED_IDX_AQUEC, aquecimentoLigado, 0);  // Intervalo 0 = LED fixo
+    
+    // Ventiladores - Velocidade do pisca proporcional à velocidade
+    updateLED(LED_IDX_VENT1, ventiladoresLigados, ventiladoresLigados ? map(velocidadeVentiladores, 0, 255, 500, 100) : 0);
+    updateLED(LED_IDX_VENT2, ventiladoresLigados, ventiladoresLigados ? map(velocidadeVentiladores, 0, 255, 500, 100) : 0);
+    
+    // Exaustores - Velocidade do pisca proporcional à velocidade
+    updateLED(LED_IDX_EXAUST1, exaustoresLigados, exaustoresLigados ? map(velocidadeExaustores, 0, 255, 500, 100) : 0);
+    updateLED(LED_IDX_EXAUST2, exaustoresLigados, exaustoresLigados ? map(velocidadeExaustores, 0, 255, 500, 100) : 0);
+    
+    // Alarme - LED piscando apenas quando ativo
+    updateLED(LED_IDX_ALARM, alarmeAtivo, alarmeAtivo ? 100 : 0);
+}
+
+ // Realiza a leitura dos sensores com intervalo entre cada sensor
 void lerSensores() {
     unsigned long tempoAtual = millis();
     
@@ -118,15 +220,15 @@ void lerSensores() {
     luminosidade = analogRead(LDR_PIN);
 }
 
-/**
- * Funções de Controle
- */
+ // Funções de Controle
 void controlarVelocidadeVentiladores(int velocidade) {
+    velocidadeVentiladores = velocidade;
     ledcWrite(CANAL_PWM_VENT1, velocidade);
     ledcWrite(CANAL_PWM_VENT2, velocidade);
 }
 
 void controlarVelocidadeExaustores(int velocidade) {
+    velocidadeExaustores = velocidade;
     ledcWrite(CANAL_PWM_EXAUST1, velocidade);
     ledcWrite(CANAL_PWM_EXAUST2, velocidade);
 }
@@ -135,13 +237,15 @@ void verificarAlarmes() {
     bool alarmeTemperatura = (tempInterna > limites.tempMax) || (tempInterna < limites.tempMin);
     bool alarmeUmidade = (umidInterna > limites.umidMax) || (umidInterna < limites.umidMin);
 
+    // Atualiza estado do alarme
     alarmeAtivo = alarmeTemperatura || alarmeUmidade;
-
-    if (alarmeAtivo && !alarmeSoado) {
-        Serial.println("### ALARME ###");
-        alarmeSoado = true;
-    } else if (!alarmeAtivo) {
-        alarmeSoado = false;
+    
+    // Se houver mudança no estado do alarme
+    static bool estadoAnterior = false;
+    if (alarmeAtivo != estadoAnterior) {
+        estadoAnterior = alarmeAtivo;
+        // Envia dados apenas quando há mudança de estado
+        enviarDadosSerial();
     }
 }
 
@@ -284,18 +388,7 @@ void controlarUmidade() {
     exaustoresLigados = (velocidadeExaust > 0);
     controlarVelocidadeExaustores(velocidadeExaust);
 }
-
-void atualizarDisplay() {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print(String(timeClient.getHours()) + ":" + String(timeClient.getMinutes()));
-    lcd.setCursor(7, 0);
-    lcd.print(alarmeAtivo ? "ALARME!" : "OK");
-}
-
-/**
- * Configuração inicial do sistema
- */
+ // Configuração inicial do sistema
 void setup() {
     Serial.begin(115200);
     Serial.println("Iniciando sistema...");
@@ -312,6 +405,10 @@ void setup() {
     Serial.println("Iniciando sensor externo...");
     dhtExterno.begin();
     delay(1000);  // Aguarda 1 segundo
+
+    // Inicialização dos LEDs
+    setupLEDs();
+    updateLED(LED_IDX_STATUS, true, 500);
 
     // Configuração dos pinos
     pinMode(VENT_1_PIN, OUTPUT);
@@ -363,17 +460,18 @@ void loop() {
         // Controle do sistema
         controlarTemperatura();
         controlarUmidade();
-        
-        // Atualização das interfaces
-        atualizarDisplay();
+
         enviarDadosMQTT();
-        
-        // Envia para o serial
+
         enviarDadosSerial();
+
+        updateSystemLEDs();
+
+        verificarAlarmes();
     }
     
-    // Pisca LED de status
-    digitalWrite(LED_STATUS, !digitalRead(LED_STATUS));
+    // Atualizar estados dos LEDs
+    updateLEDs();
 }
 
 void setupWiFi() {
@@ -453,16 +551,15 @@ void callback(char* topic, byte* payload, unsigned int length) {
 void enviarDadosMQTT() {
     StaticJsonDocument<300> doc;
     
-    doc["temp_int"] = tempInterna;
-    doc["umid_int"] = umidInterna;
-    doc["temp_ext"] = tempExterna;
-    doc["umid_ext"] = umidExterna;
-    doc["luz"] = luminosidade;
-    doc["aquec"] = aquecimentoLigado;
-    doc["vent"] = ventiladoresLigados;
-    doc["exaust"] = exaustoresLigados;
-    doc["temp_target"] = TEMP_TARGET;
-    doc["pid_output"] = pidTemp.lastError;
+    // Adiciona timestamp Unix
+    doc["time"] = timeClient.getEpochTime();
+    
+    // Dados dos sensores no formato esperado pela API
+    doc["internalTemperature"] = tempInterna;
+    doc["externalTemperature"] = tempExterna;
+    doc["internalHumidity"] = umidInterna;
+    doc["externalHumidity"] = umidExterna;
+    doc["luminosity"] = luminosidade;
     
     char buffer[300];
     serializeJson(doc, buffer);
@@ -470,10 +567,31 @@ void enviarDadosMQTT() {
     client.publish(topic_data, buffer);
 }
 
-// Adicione essa função após as outras definições
-
 void enviarDadosSerial() {
-    Serial.println("\n--- Dados dos Sensores ---");
+    Serial.println("\n--- Status do Sistema ---");
+    Serial.print("Hora: ");
+    Serial.print(timeClient.getHours());
+    Serial.print(":");
+    Serial.println(timeClient.getMinutes());
+    if (alarmeAtivo) {
+        Serial.println("### ALARME ATIVO ###");
+        if (tempInterna > limites.tempMax) {
+            Serial.println("Temperatura acima do limite!");
+        }
+        if (tempInterna < limites.tempMin) {
+            Serial.println("Temperatura abaixo do limite!");
+        }
+        if (umidInterna > limites.umidMax) {
+            Serial.println("Umidade acima do limite!");
+        }
+        if (umidInterna < limites.umidMin) {
+            Serial.println("Umidade abaixo do limite!");
+        }
+    } else {
+        Serial.println("Sistema OK");
+    }
+
+    Serial.println("--- Dados dos Sensores ---");
     Serial.print("Temperatura Interna: ");
     Serial.print(tempInterna);
     Serial.println(" °C");
@@ -493,14 +611,28 @@ void enviarDadosSerial() {
     Serial.print("Luminosidade: ");
     Serial.println(luminosidade);
     
+    Serial.println("--- Estado dos Atuadores ---");
     Serial.print("Aquecimento: ");
     Serial.println(aquecimentoLigado ? "Ligado" : "Desligado");
     
     Serial.print("Ventiladores: ");
-    Serial.println(ventiladoresLigados ? "Ligado" : "Desligado");
+    Serial.print(ventiladoresLigados ? "Ligado" : "Desligado");
+    if (ventiladoresLigados) {
+        Serial.print(" (Velocidade: ");
+        Serial.print(map(velocidadeVentiladores, 0, 255, 0, 100));
+        Serial.println("%)");
+    } else {
+        Serial.println();
+    }
     
     Serial.print("Exaustores: ");
-    Serial.println(exaustoresLigados ? "Ligado" : "Desligado");
-
+    Serial.print(exaustoresLigados ? "Ligado" : "Desligado");
+    if (exaustoresLigados) {
+        Serial.print(" (Velocidade: ");
+        Serial.print(map(velocidadeExaustores, 0, 255, 0, 100));
+        Serial.println("%)");
+    } else {
+        Serial.println();
+    }
     Serial.println("--------------------------");
 }
